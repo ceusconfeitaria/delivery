@@ -146,8 +146,8 @@ const CONFIG = {
   "nome": "Victor Pinheiro · Nubank"
  },
  "origem": {
-  "lat": null,
-  "lng": null
+  "lat": -19.995664,
+  "lng": -43.848403
  },
  "lojaEndereco": {
   "rua": "Rua Professora Emília de Lima",
@@ -274,19 +274,55 @@ $("#modo").onclick=e=>{ const b=e.target.closest("[data-m]"); if(!b) return; mod
 const rad=x=>x*Math.PI/180;
 function km(a,b){ const R=6371, dLat=rad(b.lat-a.lat), dLng=rad(b.lng-a.lng);
   const h=Math.sin(dLat/2)**2+Math.cos(rad(a.lat))*Math.cos(rad(b.lat))*Math.sin(dLng/2)**2; return 2*R*Math.asin(Math.sqrt(h)); }
+// ---------- localização (vários serviços de mapa gratuitos, um depois do outro) ----------
+const espera=ms=>new Promise(r=>setTimeout(r,ms));
+async function pegarJSON(url, ms=8000){
+  const c=new AbortController(), t=setTimeout(()=>c.abort(),ms);
+  try{ const r=await fetch(url,{signal:c.signal}); return r.ok ? await r.json() : null; }catch(e){ return null; } finally{ clearTimeout(t); }
+}
+let ultimoNominatim=0;
+async function nominatim(params){   // o serviço pede no máximo 1 consulta por segundo
+  const falta=ultimoNominatim+1100-Date.now(); if(falta>0) await espera(falta); ultimoNominatim=Date.now();
+  const j=await pegarJSON(`https://nominatim.openstreetmap.org/search?format=json&limit=1&countrycodes=br&accept-language=pt-BR&${params}`);
+  return j&&j[0] ? {lat:+j[0].lat,lng:+j[0].lon} : null;
+}
+async function photon(texto, perto){
+  const j=await pegarJSON(`https://photon.komoot.io/api/?limit=1&q=${encodeURIComponent(texto)}${perto?`&lat=${perto.lat}&lon=${perto.lng}`:""}`);
+  const f=j&&j.features&&j.features[0]; return f ? {lat:+f.geometry.coordinates[1],lng:+f.geometry.coordinates[0]} : null;
+}
+async function porCEP(cep){
+  const v=String(cep||"").replace(/\D/g,""); if(v.length!==8) return null;
+  const j=await pegarJSON(`https://brasilapi.com.br/api/cep/v2/${v}`);
+  const c=j&&j.location&&j.location.coordinates; return c&&c.latitude&&c.longitude ? {lat:+c.latitude,lng:+c.longitude} : null;
+}
+// tenta do mais exato para o mais aproximado; descarta resultados longe demais (rua de mesmo nome em outra cidade)
+async function localizar(e, perto){
+  const enc=encodeURIComponent, cidade=e.cidade||"", uf=e.uf||"";
+  const ok=p=>p && Number.isFinite(p.lat) && Number.isFinite(p.lng) && (!perto || km(perto,p)<=40);
+  const exatas=[
+    ()=>e.rua&&e.numero ? nominatim(`street=${enc(e.numero+" "+e.rua)}&city=${enc(cidade)}${uf?`&state=${enc(uf)}`:""}`) : null,
+    ()=>e.rua ? photon([e.rua+(e.numero?" "+e.numero:""),e.bairro,cidade,uf].filter(Boolean).join(", "), perto) : null,
+    ()=>e.rua ? nominatim(`street=${enc(e.rua)}&city=${enc(cidade)}${uf?`&state=${enc(uf)}`:""}`) : null,
+    ()=>e.rua ? photon([e.rua,cidade].filter(Boolean).join(", "), perto) : null,
+    ()=>porCEP(e.cep),
+  ];
+  for (const f of exatas){ const p=await f(); if(ok(p)) return {...p,aprox:false}; }
+  const aprox=[
+    ()=>e.bairro ? nominatim(`q=${enc([e.bairro,cidade,uf,"Brasil"].filter(Boolean).join(", "))}`) : null,
+    ()=>e.bairro ? photon([e.bairro,cidade,uf].filter(Boolean).join(", "), perto) : null,
+  ];
+  for (const f of aprox){ const p=await f(); if(ok(p)) return {...p,aprox:true}; }
+  return null;
+}
 // posição da loja: usa as coordenadas da configuração; se não houver, localiza pelo endereço (uma vez) e guarda
 let origemCache=null;
 async function getOrigem(){
   if (CONFIG.origem && CONFIG.origem.lat!=null) return CONFIG.origem;
   if (origemCache) return origemCache;
-  try{ const c=JSON.parse(localStorage.getItem("ceus:origem")||"null"); if(c&&c.lat) return origemCache=c; }catch(e){}
-  const L=CONFIG.lojaEndereco, tent=[
-    `street=${encodeURIComponent(L.numero+" "+L.rua)}&city=${encodeURIComponent(L.cidade)}&state=${encodeURIComponent(L.uf)}&country=Brasil`,
-    `q=${encodeURIComponent([L.rua,L.bairro,L.cidade,L.uf,"Brasil"].join(", "))}`,
-    `postalcode=${encodeURIComponent(L.cep)}&country=Brasil`];
-  for (const t of tent){ try{ const r=await fetch(`https://nominatim.openstreetmap.org/search?format=json&limit=1&countrycodes=br&${t}`); const j=await r.json();
-    if (j&&j[0]){ origemCache={lat:+j[0].lat,lng:+j[0].lon}; try{ localStorage.setItem("ceus:origem",JSON.stringify(origemCache)); }catch(e){} return origemCache; } }catch(e){} }
-  return null;
+  try{ const c=JSON.parse(localStorage.getItem("ceus:origem2")||"null"); if(c&&c.lat) return origemCache=c; }catch(e){}
+  const L=CONFIG.lojaEndereco, p=await localizar({rua:L.rua,numero:L.numero,bairro:L.bairro,cidade:L.cidade,uf:L.uf,cep:L.cep}, null);
+  if (p && !p.aprox){ origemCache={lat:p.lat,lng:p.lng}; try{ localStorage.setItem("ceus:origem2",JSON.stringify(origemCache)); }catch(e){} return origemCache; }
+  return p ? {lat:p.lat,lng:p.lng} : null;
 }
 async function aplicarDistancia(pos){
   const o=await getOrigem();
@@ -294,7 +330,9 @@ async function aplicarDistancia(pos){
   const d=km(o,pos); const f=CONFIG.faixas.find(x=>d<=x.ateKm);
   entrega = f ? {km:Math.round(d*10)/10, taxa:Math.round(f.taxa*100), fora:false} : {km:Math.round(d*10)/10, taxa:null, fora:true};
   const r=$("#res");
-  if (f){ r.className="res ok"; r.textContent=`${entrega.km.toLocaleString("pt-BR")} km da loja · taxa de entrega ${money(entrega.taxa)}`; }
+  entrega.aprox=!!pos.aprox;
+  if (f && pos.aprox){ r.className="res info"; r.textContent=`Achamos só o bairro no mapa: cerca de ${entrega.km.toLocaleString("pt-BR")} km da loja · taxa estimada ${money(entrega.taxa)} (confirmamos pelo WhatsApp). Para o valor exato, toque em “Usar minha localização”.`; }
+  else if (f){ r.className="res ok"; r.textContent=`${entrega.km.toLocaleString("pt-BR")} km da loja · taxa de entrega ${money(entrega.taxa)}`; }
   else { r.className="res bad"; r.textContent=`${entrega.km.toLocaleString("pt-BR")} km da loja: fora da nossa área de entrega (até ${CONFIG.faixas[CONFIG.faixas.length-1].ateKm} km). Você pode escolher “Retirar no balcão”.`; }
   atualizar();
 }
@@ -309,16 +347,13 @@ $("#f-cep").addEventListener("input",async e=>{
 $("#b-calc").onclick=async()=>{
   const rua=$("#f-rua").value.trim(), num=$("#f-num").value.trim(), cid=$("#f-cid").value.trim()||CONFIG.cidade, bai=$("#f-bai").value.trim();
   const r=$("#res"); if(!rua||!num){ r.className="res bad"; r.textContent="Preencha a rua e o número (ou use sua localização)."; return; }
-  r.className="res info"; r.textContent="Calculando…";
+  r.className="res info"; r.textContent="Procurando o endereço no mapa…"; $("#b-calc").disabled=true;
   const [cidade,uf]=cid.split(/\s*-\s*/);
-  const tentativas=[
-    `street=${encodeURIComponent(num+" "+rua)}&city=${encodeURIComponent(cidade)}${uf?`&state=${encodeURIComponent(uf)}`:""}&country=Brasil`,
-    `q=${encodeURIComponent([rua+" "+num,bai,cid,"Brasil"].filter(Boolean).join(", "))}`,
-    `q=${encodeURIComponent([rua,bai,cid,"Brasil"].filter(Boolean).join(", "))}`];
-  for (const t of tentativas){
-    try{ const res=await fetch(`https://nominatim.openstreetmap.org/search?format=json&limit=1&countrycodes=br&${t}`,{headers:{"Accept-Language":"pt-BR"}});
-      const j=await res.json(); if (j&&j[0]) return await aplicarDistancia({lat:+j[0].lat,lng:+j[0].lon}); }catch(err){}
-  }
+  try{
+    const o=await getOrigem();
+    const p=await localizar({rua,numero:num,bairro:bai,cidade,uf:uf||"",cep:$("#f-cep").value}, o);
+    if (p) return await aplicarDistancia(p);
+  } finally { $("#b-calc").disabled=false; }
   entrega={km:null,taxa:null,fora:false};
   r.className="res bad"; r.textContent="Não encontramos esse endereço no mapa. Toque em “Usar minha localização” ou envie mesmo assim: a gente confirma a taxa pelo WhatsApp.";
   atualizar();
@@ -356,7 +391,7 @@ $("#b-send").onclick=async()=>{
   const sub=subtotal(), tx = modo==="E" ? entrega.taxa : 0, tot=sub+(tx||0);
   const obs=$("#f-obs").value.trim().replace(/\s+/g," ");
   const linhas=[`*Pedido – ${CONFIG.loja}*`, `Nome: ${nome}`, `Telefone: ${tel}`, `Tipo: ${modo==="E"?"Entrega":"Retirada no balcão"}`];
-  if (modo==="E"){ linhas.push(`Endereço: ${endereco}`); if(entrega.km!=null) linhas.push(`Distância: ${entrega.km.toLocaleString("pt-BR")} km`); }
+  if (modo==="E"){ linhas.push(`Endereço: ${endereco}`); if(entrega.km!=null) linhas.push(`Distância: ${entrega.aprox?"cerca de ":""}${entrega.km.toLocaleString("pt-BR")} km${entrega.aprox?" (taxa a confirmar)":""}`); }
   linhas.push("", "*Itens*", ...its.map(({p,q})=>`${q}x ${p.nome} – ${money(p.preco*q)}`), "", `Subtotal: ${money(sub)}`);
   if (modo==="E") linhas.push(`Taxa de entrega: ${tx==null?"a confirmar":money(tx)}`);
   linhas.push(`*Total: ${money(tot)}${modo==="E"&&tx==null?" + taxa":""}*`, "Pagamento: PIX antecipado (envio o comprovante a seguir)");
